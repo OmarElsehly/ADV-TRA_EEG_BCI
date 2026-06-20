@@ -1,146 +1,122 @@
 # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class AdvancedWilsonCowanPINN(nn.Module):
-    def __init__(self, num_channels=22, temporal_filters=16, time_steps=500, num_classes=4):
-        super(AdvancedWilsonCowanPINN, self).__init__()
+class WCEEGNetPINN(nn.Module):
+    def __init__(self, num_channels=22, F1=8, D=2, num_classes=4, fs=250, pool_factor=8):
+        super().__init__()
+        self.F1 = F1
+        self.D = D
+        self.fs = fs
+        self.pool_factor = pool_factor
+        self.dt_phys = pool_factor / fs
 
-        self.temporal_filters = temporal_filters
-
-        # ==========================================
-        # 1. MULTI-SCALE TEMPORAL FILTERING
-        # ==========================================
-        self.temp_conv_mu = nn.Conv1d(in_channels=1,
-                                      out_channels=temporal_filters,
-                                      kernel_size=65, padding=32, bias=False)
-
-        self.temp_conv_beta = nn.Conv1d(in_channels=1,
-                                        out_channels=temporal_filters,
-                                        kernel_size=33, padding=16, bias=False)
-
-        self.bn_temp = nn.BatchNorm2d(temporal_filters * 2)
+        assert D == 2, "D must be 2 to split spatial features into Excitatory and Inhibitory pairs."
 
         # ==========================================
-        # 2. DEPTHWISE SPATIAL CONVOLUTION (Matches your 78.pth weights!)
+        # 1. MULTI-SCALE TEMPORAL BRANCHES
         # ==========================================
-        self.depthwise_spatial = nn.Conv2d(in_channels=temporal_filters * 2, 
-                                           out_channels=temporal_filters * 2,
-                                           kernel_size=(num_channels, 1), 
-                                           groups=temporal_filters * 2, 
-                                           bias=False)
+        # Branch 1: Long window (0.5s) for mu-rhythm
+        self.temp_conv_mu = nn.Conv2d(1, F1, kernel_size=(1, fs // 2), padding='same', bias=False)
+        # Branch 2: Short window (0.25s) for beta-rhythm
+        self.temp_conv_beta = nn.Conv2d(1, F1, kernel_size=(1, fs // 4), padding='same', bias=False)
 
-        self.bn_spatial = nn.BatchNorm2d(temporal_filters * 2)
-        self.gelu = nn.GELU()
-        self.avg_pool = nn.AvgPool2d(kernel_size=(1, 8), stride=(1, 8))
-        self.spatial_dropout = nn.Dropout2d(p=0.4)
+        # We now have 2 * F1 temporal filters
+        F_multi = F1 * 2
 
-        # ==========================================
-        # 3. SQUEEZE-AND-EXCITATION (SE) ATTENTION
-        # ==========================================
-        self.se_fc1 = nn.Linear(temporal_filters * 2, (temporal_filters * 2) // 4)
-        self.se_fc2 = nn.Linear((temporal_filters * 2) // 4, temporal_filters * 2)
+        self.bn1 = nn.BatchNorm2d(F_multi)
+
+        # Depthwise scales to the new F_multi dimension
+        self.depthwise = nn.Conv2d(F_multi, F_multi * D, kernel_size=(num_channels, 1), groups=F_multi, bias=False)
+        self.bn2 = nn.BatchNorm2d(F_multi * D)
+        self.activation = nn.ELU()
 
         # ==========================================
-        # 4. WILSON-COWAN GAT & PHYSICS PARAMETERS
+        # 2. SCALED PHYSICS PARAMETERS
         # ==========================================
-        self.attention = nn.MultiheadAttention(embed_dim=temporal_filters * 2, num_heads=4, batch_first=True)
+        # The ODE now simulates F_multi (16) populations instead of 8
+        self.tau_E = nn.Parameter(torch.full((1, F_multi, 1), 0.01))
+        self.tau_I = nn.Parameter(torch.full((1, F_multi, 1), 0.01))
+        self.w_EE = nn.Parameter(torch.full((1, F_multi, 1), 1.2))
+        self.w_EI = nn.Parameter(torch.full((1, F_multi, 1), 1.0))
+        self.w_IE = nn.Parameter(torch.full((1, F_multi, 1), 1.0))
+        self.w_II = nn.Parameter(torch.full((1, F_multi, 1), 0.5))
+        self.P = nn.Parameter(torch.zeros(1, F_multi, 1))
+        self.Q = nn.Parameter(torch.zeros(1, F_multi, 1))
 
-        self.project_E = nn.Linear(temporal_filters * 2, 1)
-        self.project_I = nn.Linear(temporal_filters * 2, 1)
-        self.project_P = nn.Linear(temporal_filters * 2, 1)
-        self.project_Q = nn.Linear(temporal_filters * 2, 1)
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout(p=0.5)
 
-        self.w_EE = nn.Parameter(torch.tensor(1.2))
-        self.w_EI = nn.Parameter(torch.tensor(1.0))
-        self.w_IE = nn.Parameter(torch.tensor(1.0))
-        self.w_II = nn.Parameter(torch.tensor(0.5))
-        self.tau_E = nn.Parameter(torch.tensor(0.1))
-        self.tau_I = nn.Parameter(torch.tensor(0.1))
+        # FUSED CLASSIFIER: Adjusted for F_multi
+        fused_feature_dim = (F_multi * D) + F_multi + F_multi
+        self.classifier = nn.Linear(fused_feature_dim, num_classes)
+        self._init_weights()
 
-        # ==========================================
-        # 5. ROBUST CLASSIFIER
-        # ==========================================
-        self.classifier = nn.Sequential(
-            nn.Linear(temporal_filters * 2, 64),
-            nn.BatchNorm1d(64),
-            nn.GELU(),
-            nn.Dropout(0.5),
-            nn.Linear(64, num_classes)
-        )
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
-    def forward(self, x):
-        B, C, T = x.shape
+    def compute_wc_loss(self, E, I):
+        tE, tI = F.softplus(self.tau_E), F.softplus(self.tau_I)
+        wEE, wEI = F.softplus(self.w_EE), F.softplus(self.w_EI)
+        wIE, wII = F.softplus(self.w_IE), F.softplus(self.w_II)
 
-        x = x.unsqueeze(1)
+        dE_dt = (E[:, :, 1:] - E[:, :, :-1]) / self.dt_phys
+        dI_dt = (I[:, :, 1:] - I[:, :, :-1]) / self.dt_phys
+        E_t, I_t = E[:, :, :-1], I[:, :, :-1]
 
-        # 1. Temporal Extraction
-        x_flat = x.view(B * C, 1, T)
-        x_mu = self.temp_conv_mu(x_flat)
-        x_beta = self.temp_conv_beta(x_flat)
+        drv_E = wEE * E_t - wEI * I_t + self.P
+        drv_I = wIE * E_t - wII * I_t + self.Q
 
-        x_temp = torch.cat([x_mu, x_beta], dim=1)
-        x_temp = x_temp.view(B, C, self.temporal_filters * 2, T).permute(0, 2, 1, 3)
-        x_temp = self.bn_temp(x_temp)
+        res_E = tE * dE_dt + E_t - torch.sigmoid(drv_E)
+        res_I = tI * dI_dt + I_t - torch.sigmoid(drv_I)
 
-        # 2. Unified Depthwise Spatial Processing over all channels
-        x_spat = self.depthwise_spatial(x_temp)
+        return torch.mean(res_E ** 2) + torch.mean(res_I ** 2)
 
-        x_spat = self.bn_spatial(x_spat)
-        x_spat = self.gelu(x_spat)
-        x_spat = self.avg_pool(x_spat)
-        x_spat = self.spatial_dropout(x_spat)
+    def forward(self, x, fingerprint_mode=False):
+        if x.ndim == 3:
+            x = x.unsqueeze(1)
 
-        # 3. Squeeze-and-Excitation Recalibration
-        se_weight = x_spat.mean(dim=-1).squeeze(-1)
-        se_weight = self.gelu(self.se_fc1(se_weight))
-        se_weight = torch.sigmoid(self.se_fc2(se_weight)).unsqueeze(-1).unsqueeze(-1)
-        x_spat = x_spat * se_weight
+        # 1. Parallel Temporal Extraction
+        x_mu = self.temp_conv_mu(x)
+        x_beta = self.temp_conv_beta(x)
 
-        x_attn = x_spat.squeeze(2).permute(0, 2, 1)
+        # Concatenate along the channel dimension (dim=1)
+        x_concat = torch.cat([x_mu, x_beta], dim=1)
 
-        # 4. GAT Layer
-        attn_out, _ = self.attention(x_attn, x_attn, x_attn)
+        # 2. Main Spatial Extraction
+        x_norm = self.bn1(x_concat)
+        x_main = self.activation(self.bn2(self.depthwise(x_norm)))
 
-        # Extract Wilson-Cowan States
-        E = torch.sigmoid(self.project_E(attn_out))
-        I = torch.sigmoid(self.project_I(attn_out))
-        P = self.project_P(attn_out)
-        Q = self.project_Q(attn_out)
+        # 3. Physics Branch
+        x_phys = F.avg_pool1d(x_main.squeeze(2), self.pool_factor)
 
-        loss_wc = self.compute_wc_loss(E, I, P, Q)
+        # Split into Excitatory and Inhibitory (using the dynamically scaled F_multi)
+        F_multi = self.F1 * 2
+        E_phys = torch.sigmoid(x_phys[:, :F_multi, :])
+        I_phys = torch.sigmoid(x_phys[:, F_multi:, :])
 
-        # 5. Classification
-        final_features = attn_out.mean(dim=1)
-        logits = self.classifier(final_features)
+        # 4. Feature Fusion
+        E_feat = E_phys.mean(dim=-1)
+        I_feat = I_phys.mean(dim=-1)
+        x_pool = torch.flatten(self.avg_pool(x_main), 1)
 
+        fused_features = self.dropout(torch.cat([x_pool, E_feat, I_feat], dim=-1))
+        logits = self.classifier(fused_features)
+
+        # ADV-TRA Routing Escape Hatch
+        if fingerprint_mode:
+            return logits
+
+        loss_wc = self.compute_wc_loss(E_phys, I_phys)
         return logits, loss_wc
 
-    def compute_wc_loss(self, E, I, P, Q):
-        wEE = F.softplus(self.w_EE)
-        wEI = F.softplus(self.w_EI)
-        wIE = F.softplus(self.w_IE)
-        wII = F.softplus(self.w_II)
-        tauE = F.softplus(self.tau_E)
-        tauI = F.softplus(self.tau_I)
-
-        dE_dt = E[:, 1:, :] - E[:, :-1, :]
-        dI_dt = I[:, 1:, :] - I[:, :-1, :]
-
-        E_t, I_t = E[:, :-1, :], I[:, :-1, :]
-        P_t, Q_t = P[:, :-1, :], Q[:, :-1, :]
-
-        E_input = (wEE * E_t) - (wEI * I_t) + P_t
-        res_E = (tauE * dE_dt) + E_t - torch.sigmoid(E_input)
-
-        I_input = (wIE * E_t) - (wII * I_t) + Q_t
-        res_I = (tauI * dI_dt) + I_t - torch.sigmoid(I_input)
-
-        return torch.mean(res_E**2) + torch.mean(res_I**2)
-
 def get_model(model_name, num_classes=4, **kwargs):
-    if model_name == 'bci_sub2a' or model_name == 'pinn':
-        return AdvancedWilsonCowanPINN(num_channels=22, time_steps=500, num_classes=num_classes)
-    else:
-        raise ValueError(f"Unknown architecture request: '{model_name}'")
+    return WCEEGNetPINN(num_channels=22, F1=8, D=2, num_classes=num_classes, fs=250, pool_factor=8)

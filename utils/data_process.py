@@ -3,169 +3,139 @@ import os
 import glob
 import numpy as np
 import scipy.io as sio
-from scipy.signal import butter, lfilter
+import scipy.signal as signal
 import torch
+import mne
 from torch.utils.data import Dataset
 
-def butter_bandpass(lowcut, highcut, fs, order=5):
-    nyq = 0.5 * fs
-    low = lowcut / nyq
-    high = highcut / nyq
-    b, a = butter(order, [low, high], btype='band')
-    return b, a
+class BCICausalPreprocessor:
+    def __init__(self, lowcut=8.0, highcut=30.0, fs=250):
+        self.fs = fs
+        self.lowcut = lowcut
+        self.highcut = highcut
+        self.eog_weights = None
+        self.b, self.a = signal.butter(4, [self.lowcut, self.highcut], btype='bandpass', fs=self.fs)
 
-def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
-    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
-    y = lfilter(b, a, data, axis=0)
-    return y
+    def fit_eog_regression(self, eeg_data, eog_data):
+        eog_with_bias = np.vstack([eog_data, np.ones(eog_data.shape[1])])
+        eog_cov = np.linalg.pinv(eog_with_bias @ eog_with_bias.T)
+        self.eog_weights = eog_cov @ eog_with_bias @ eeg_data.T
+        return self.eog_weights
 
-class BCIEvalDataset(Dataset):
-    """
-    Custom Dataset built for pre-segmented/short MAT files.
-    Slides windows directly across the signal matrix without relying on trigger arrays.
-    """
-    def __init__(self, file_paths, window_size=500, stride=50, offset_start=125):
-        self.samples = []
-        self.labels = []
+    def apply_eog_regression(self, eeg_data, eog_data):
+        if self.eog_weights is None:
+            raise ValueError("Fit the preprocessor on training data first!")
+        eog_with_bias = np.vstack([eog_data, np.ones(eog_data.shape[1])])
+        return eeg_data - (self.eog_weights.T @ eog_with_bias)
+
+    def process_file(self, filepath, is_training=True):
+        raw = mne.io.read_raw_gdf(filepath, preload=True, verbose='WARNING')
+        data = raw.get_data()
+        np.nan_to_num(data, copy=False, nan=0.0)
+
+        eeg_data, eog_data = data[:22, :], data[22:25, :]
+        if is_training:
+            self.fit_eog_regression(eeg_data, eog_data)
+
+        eeg_clean = self.apply_eog_regression(eeg_data, eog_data)
+        eeg_filtered = signal.lfilter(self.b, self.a, eeg_clean, axis=-1)
+        events, event_dict = mne.events_from_annotations(raw, verbose=False)
+        return eeg_filtered, events, event_dict
+
+def generate_causal_windows(eeg_filtered, events, event_dict, mat_labels=None, window_size_sec=2.0, fs=250, is_training=True):
+    window_samples = int(window_size_sec * fs)
+    offset_start, offset_end = int(0.5 * fs), int(3.5 * fs)
+    stride = int(0.2 * fs)
+
+    total_samples = eeg_filtered.shape[1]
+    mne_id_to_gdf_str = {v: k for k, v in event_dict.items()}
+    
+    # Session T tracks class targets directly. Session E maps chronological '783' cues to MAT variables.
+    target_events = {'769': 0, '770': 1, '771': 2, '772': 3} if is_training else {'783': -1}
+
+    X_windows, y_labels, time_indices = [], [], []
+    eval_cue_idx = 0
+
+    for sample_idx, _, mne_event_id in events:
+        gdf_event_str = mne_id_to_gdf_str.get(mne_event_id, "")
         
-        # We deduce the label using a lookup table or checking if a default 'y' exists
-        for file_path in file_paths:
-            print(f"   Processing: {os.path.basename(file_path)}")
-            mat_data = sio.loadmat(file_path)
-            
-            if 'data' not in mat_data:
-                continue
-                
-            struct_data = mat_data['data'][0, 0][0, 0]
-            raw_signals = struct_data['X']  
-            
-            # Extract sampling rate (default to 250 Hz)
-            fs = struct_data['fs'][0, 0] if 'fs' in struct_data.dtype.names else 250
-            
-            # Apply mandatory 8.0 Hz - 30.0 Hz bandpass filtering configuration
-            filtered_signals = butter_bandpass_filter(raw_signals[:, :22], lowcut=8.0, highcut=30.0, fs=fs)
-            
-            # Check if there is an overall file label, fallback to 1 (Left Hand) if empty
-            raw_labels = np.ravel(struct_data['y']) if 'y' in struct_data.dtype.names else []
-            if len(raw_labels) > 0 and not np.isnan(raw_labels[0]):
-                label_val = int(raw_labels[0].item())
+        if gdf_event_str in target_events:
+            # Resolve true class labels sequentially for Session E tracking
+            if not is_training:
+                if mat_labels is not None and eval_cue_idx < len(mat_labels):
+                    label = int(mat_labels[eval_cue_idx])
+                else:
+                    label = 0  # Fallback boundary default state
+                eval_cue_idx += 1
             else:
-                # Dynamic fallback based on file naming convention string parsing if labels are stripped
-                # Maps characters to classes: A01 -> class 1, A02 -> class 2 etc., clamped to 1-4
-                try:
-                    file_num = int(''.join(filter(str.isdigit, os.path.basename(file_path))))
-                    label_val = ((file_num - 1) % 4) + 1 
-                except ValueError:
-                    label_val = 1 # Absolute baseline fallback
-            
-            # Slide windows across the duration of the matrix slice
-            # Skip the initial setup offset boundary delay
-            start_idx = offset_start
-            total_len = filtered_signals.shape[0]
-            
-            i = start_idx
-            while i + window_size <= total_len:
-                window = filtered_signals[i:i+window_size, :] # (500, 22)
+                label = target_events[gdf_event_str]
                 
-                # Transpose matrix dimensions to match expected neural layer formats: (22, 500)
-                window_tensor = torch.tensor(window, dtype=torch.float32).t()
-                
-                # Window-Level Z-Score Normalization
-                mean = window_tensor.mean(dim=1, keepdim=True)
-                std = window_tensor.std(dim=1, keepdim=True) + 1e-8
-                window_tensor = (window_tensor - mean) / std
-                
-                self.samples.append(window_tensor)
-                self.labels.append(label_val - 1) # Remap 1-4 to 0-3 index range
-                i += stride
+            start_idx = sample_idx + offset_start
+            end_idx = sample_idx + offset_end
 
-    def __len__(self):
-        return len(self.samples)
+            for t in range(start_idx + window_samples, end_idx, stride):
+                if t <= total_samples:
+                    window = eeg_filtered[:, t - window_samples : t]
+                    if window.shape[1] == window_samples:
+                        X_windows.append(window)
+                        y_labels.append(label)
+                        time_indices.append((t - start_idx) / fs)
 
-    def __getitem__(self, item):
-        return self.samples[item], self.labels[item]
-
-
-def get_data(dataset, data_root):
-    if dataset == 'bci_sub2a':
-        eval_files = sorted(glob.glob(os.path.join(data_root, "*.mat")))
-        if len(eval_files) == 0:
-            raise FileNotFoundError(f"Could not locate any .mat files inside: {data_root}")
-        print(f"--> Parsing dataset using {len(eval_files)} files found in storage.")
-        return BCIEvalDataset(eval_files)
-    else:
-        raise ValueError(f"Unsupported dataset choice: '{dataset}'.")
-
-
-class DatasetSplit(Dataset):
-    def __init__(self, dataset, num_data):
-        self.dataset = dataset
-        idxs = np.arange(len(dataset))
-        self.idxs = np.random.choice(idxs, num_data, replace=False)
-
-    def __len__(self):
-        return len(self.idxs)
-
-    def __getitem__(self, item):
-        image, label = self.dataset[self.idxs[item]]
-        return image, label
-
+    return (np.array(X_windows, dtype=np.float32),
+            np.array(y_labels, dtype=np.int64),
+            np.array(time_indices, dtype=np.float32))
 
 def allocate_data(args):
-    raw_data_folder = f"./ADV-TRA-master/data/{args.dataset}/raw_files"
-    dataset = get_data(args.dataset, data_root=raw_data_folder)
-    
-    list_loader = list(dataset)
-    
-    if len(list_loader) == 0:
-        raise Exception("Zero sliding window samples were extracted. File shapes are too short for configured window size bounds.")
-    
-    requested_total = args.num_attack + args.num_train
-    if len(list_loader) < requested_total:
-        print(f"⚠️ Notice: Total extracted segments ({len(list_loader)}) is lower than requested bounds ({requested_total}).")
-        num_train = int(len(list_loader) * 0.6)
-        num_attack = int(len(list_loader) * 0.3)
-        print(f"--> Dynamically adjusting allocation sizes to Train: {num_train}, Attack/Anchor: {num_attack}")
-    else:
-        num_train = args.num_train
-        num_attack = args.num_attack
+    raw_data_folder = f"{args.data_path}/{args.dataset}/raw_files"
+    train_gdf = sorted(glob.glob(os.path.join(raw_data_folder, "*T.gdf")))
+    eval_gdf = sorted(glob.glob(os.path.join(raw_data_folder, "*E.gdf")))
+    mat_files = sorted(glob.glob(os.path.join(raw_data_folder, "*.mat")))
 
-    X, y = [], []
-    for data in list_loader:
-        X.append(data[0].unsqueeze(0))
-        y.append(data[1])
-        
-    X = torch.cat(X, axis=0) 
-    y = torch.tensor(y)
-    
-    if args.shuffle == True:
-        idx = torch.randperm(len(list_loader))
-    else:
-        idx = torch.arange(len(list_loader))
-        
-    X = X[idx]
-    y = y[idx]
-    
-    X_train = X[0:num_train]
-    X_remain = X[num_train:]
-    y_train = y[0:num_train]
-    y_remain = y[num_train:]
-    
-    X_attack = X_remain[0:num_attack]
-    X_remain = X_remain[num_attack:]
-    y_attack = y_remain[0:num_attack]
-    y_remain = y_remain[num_attack:]
-    
+    if not train_gdf or not eval_gdf:
+        raise FileNotFoundError(f"Ensure your T and E files exist in {raw_data_folder}")
+
+    # Step 1: Ingest trial labels safely from MAT file structures
+    mat_labels = None
+    if mat_files:
+        print(f"Loading companion true evaluation labels: {os.path.basename(mat_files[0])}")
+        mat_contents = sio.loadmat(mat_files[0])
+        for key in ['classlabel', 'labels']:
+            if key in mat_contents:
+                mat_labels = mat_contents[key].flatten()
+                break
+        if mat_labels is not None and mat_labels.min() == 1:
+            mat_labels = mat_labels - 1  # Standardize class layout array to 0-3 range
+
+    print("Initializing Preprocessor Blueprint...")
+    preprocessor = BCICausalPreprocessor()
+
+    print("Processing Training Data Stream...")
+    train_eeg, train_events, train_dict = preprocessor.process_file(train_gdf[0], is_training=True)
+    X_train, y_train, _ = generate_causal_windows(train_eeg, train_events, train_dict, mat_labels=None, is_training=True)
+
+    print("Processing Evaluation Data Stream with Dynamic MAT Chronological Index Mapping...")
+    eval_eeg, eval_events, eval_dict = preprocessor.process_file(eval_gdf[0], is_training=False)
+    X_attack, y_attack, t_attack = generate_causal_windows(eval_eeg, eval_events, eval_dict, mat_labels=mat_labels, is_training=False)
+
+    print("Computing global training normalization statistics to prevent data leakage...")
+    train_mean = np.mean(X_train, axis=(0, 2), keepdims=True)
+    train_std = np.std(X_train, axis=(0, 2), keepdims=True) + 1e-8
+
+    X_train_norm = (X_train - train_mean) / train_std
+    X_attack_norm = (X_attack - train_mean) / train_std
+
     data_log = {
-        "X_train": X_train, "y_train": y_train,
-        "X_attack": X_attack, "y_attack": y_attack,
-        "X_remain": X_remain, "y_remain": y_remain
+        "X_train": torch.tensor(X_train_norm, dtype=torch.float32),
+        "y_train": torch.tensor(y_train, dtype=torch.long),
+        "X_attack": torch.tensor(X_attack_norm, dtype=torch.float32),
+        "y_attack": torch.tensor(y_attack, dtype=torch.long),
+        "t_attack": t_attack,
+        "train_mean": torch.tensor(train_mean, dtype=torch.float32),
+        "train_std": torch.tensor(train_std, dtype=torch.float32),
+        "eog_weights": torch.tensor(preprocessor.eog_weights, dtype=torch.float32) if preprocessor.eog_weights is not None else None
     }
-    
-    data_dir = args.data_path + '/' + args.dataset + '/allocated_data'
+
+    data_dir = f"{args.data_path}/{args.dataset}/allocated_data"
     os.makedirs(data_dir, exist_ok=True)
-    save_path = data_dir + '/data_log.pth'
-    torch.save(data_log, save_path)
-    
-    print(f"\n🎉 Success! Total samples processed into tensors: {len(list_loader)}")
-    print(f"--> Saved data_log.pth successfully to target folder location: {save_path}")
+    torch.save(data_log, f"{data_dir}/data_log.pth")
+    print(f"\n🎉 Success! Extracted {X_train_norm.shape[0]} train and {X_attack_norm.shape[0]} evaluation windows.")
