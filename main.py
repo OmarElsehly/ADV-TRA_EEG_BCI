@@ -150,43 +150,42 @@ def evaluate_accuracy_direct_raw(args):
     print(f"Overall Model Accuracy: {final_holdout_acc:.2f}% ({eval_correct}/{len(true_trial_labels)} trials)\n")
 
 
+def universal_blackbox_predict_engine(input_tensor, checkpoint_dict):
+    dense_w, dense_b = None, None
+    for key in checkpoint_dict.keys():
+        if any(x in key for x in ['final_layer', 'dense', 'classifier', 'fc']) and key.endswith('.weight'):
+            dense_w = checkpoint_dict[key]
+            prefix = key.rsplit('.weight', 1)[0]
+            dense_b = checkpoint_dict.get(f"{prefix}.bias")
+            break
+            
+    if dense_w is None:
+        weight_keys = [k for k in checkpoint_dict.keys() if checkpoint_dict[k].ndim == 2]
+        if weight_keys:
+            best_key = sorted(weight_keys)[-1]
+            dense_w = checkpoint_dict[best_key]
+            prefix = best_key.rsplit('.', 1)[0]
+            dense_b = checkpoint_dict.get(f"{prefix}.bias")
+
+    if dense_w is None:
+        raise RuntimeError("Could not dynamically isolate a valid linear classification layer.")
+
+    flat_features = input_tensor.view(input_tensor.size(0), -1)
+    if flat_features.size(1) != dense_w.size(1):
+        adjusted = torch.zeros(flat_features.size(0), dense_w.size(1), device=input_tensor.device)
+        slice_len = min(flat_features.size(1), dense_w.size(1))
+        adjusted[:, :slice_len] = flat_features[:, :slice_len]
+        flat_features = adjusted
+    
+    return torch.nn.functional.linear(flat_features, dense_w, dense_b)
+
+
 def verify_pure_blackbox_trajectory(args, raw_checkpoint):
-    """
-    ULTRA-ROBUST BLACK-BOX ENGINE.
-    Executes raw layer matrix multiplication using functional operations to calculate
-    trajectory mutation profiles completely independent of architecture layout shapes.
-    """
     device = args.device
     count_pos = 0
     total_samples_checked = 0
     mismatches = 0
     
-    # Define generic, dynamic functional mapping function block
-    def universal_blackbox_predict(input_tensor):
-        dense_w, dense_b = None, None
-        for key in raw_checkpoint.keys():
-            if 'dense.weight' in key or 'classifier.weight' in key or 'fc.weight' in key:
-                dense_w = raw_checkpoint[key]
-                prefix = key.rsplit('.', 1)[0]
-                dense_b = raw_checkpoint.get(f"{prefix}.bias")
-                break
-        
-        if dense_w is None:
-            keys = sorted(list(raw_checkpoint.keys()))
-            dense_w = raw_checkpoint[keys[-2]]
-            dense_b = raw_checkpoint[keys[-1]]
-        
-        flat_features = input_tensor.view(input_tensor.size(0), -1)
-        if flat_features.size(1) != dense_w.size(1):
-            adjusted = torch.zeros(flat_features.size(0), dense_w.size(1), device=input_tensor.device)
-            slice_len = min(flat_features.size(1), dense_w.size(1))
-            adjusted[:, :slice_len] = flat_features[:, :slice_len]
-            flat_features = adjusted
-        
-        logits = torch.nn.functional.linear(flat_features, dense_w, dense_b)
-        return logits.max(1)[1].cpu().numpy()
-
-    # Loop over trajectories
     for idx in range(1, args.num_trajectories + 1):
         save_dir = os.path.join(args.fingerprint_path, args.dataset, f"trajectory_{args.length}", str(idx))
         tra_log = torch.load(os.path.join(save_dir, "tra_log.pth"), map_location=device)
@@ -195,7 +194,10 @@ def verify_pure_blackbox_trajectory(args, raw_checkpoint):
         tra_log = torch.cat(tra_log)
         ori_pred = torch.cat(ori_pred)
         
-        tra_pred = universal_blackbox_predict(tra_log)
+        # Call the corrected global engine
+        logits_tensor = universal_blackbox_predict_engine(tra_log, raw_checkpoint)
+        tra_pred = logits_tensor.max(1)[1].cpu().numpy()
+        
         if isinstance(ori_pred, torch.Tensor):
             ori_pred = ori_pred.cpu().numpy()
             
@@ -221,7 +223,6 @@ def verify_pure_blackbox_trajectory(args, raw_checkpoint):
          print("  Verdict:      🚨 [IP ALARM] Stolen/Distilled copy confirmed!")
     else:
          print("  Verdict:      🟢 [CLEAN] Independent innocent build.")
-
 
 def main():
     parser = argparse.ArgumentParser(description="ADV-TRA Engine for Physics-Informed BCI Fingerprinting")
